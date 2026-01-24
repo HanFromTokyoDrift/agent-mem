@@ -21,19 +21,19 @@
 
 ```mermaid
 graph LR
-    File[📝 Markdown/Logs] --> Watcher[👀 Go Watcher]
-    Watcher --> Ingester[⚙️ Ingest Pipeline]
+    File["📝 Markdown/Logs"] --> Watcher["👀 Go Watcher"]
+    Watcher --> Ingester["⚙️ Ingest Pipeline"]
     
     subgraph "Core Logic"
-        Ingester --> Classifier[🏷️ Classify]
-        Classifier --> Distiller[⚗️ Distill (Qwen)]
-        Distiller --> Embedder[📐 Vectorize]
-        Embedder --> Arbiter[⚖️ Arbitrate]
+        Ingester --> Classifier["🏷️ Classify"]
+        Classifier --> Distiller["⚗️ Distill (Qwen)"]
+        Distiller --> Embedder["📐 Vectorize"]
+        Embedder --> Arbiter["⚖️ Arbitrate"]
     end
     
-    Arbiter --> DB[(🐘 PostgreSQL + pgvector)]
+    Arbiter --> DB[("🐘 PostgreSQL + pgvector")]
     
-    User[🤖 Claude/Cursor] -- MCP Protocol --> Server[🚀 MCP Server]
+    User["🤖 Claude/Cursor"] -- MCP Protocol --> Server["🚀 MCP Server"]
     Server --> DB
 ```
 
