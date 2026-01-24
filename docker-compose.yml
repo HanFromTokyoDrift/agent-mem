@@ -1,0 +1,33 @@
+version: '3.8'
+
+services:
+  # The "Brain" Database: All-in-one Relational + Vector + JSON
+  cortex-db:
+    image: pgvector/pgvector:pg16
+    container_name: agent-mem-db
+    restart: always
+    environment:
+      POSTGRES_USER: cortex
+      POSTGRES_PASSWORD: cortex_password_secure
+      POSTGRES_DB: cortex_knowledge
+    ports:
+      - "5440:5432"
+    volumes:
+      - cortex_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U cortex -d cortex_knowledge"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # Adminer disabled due to port conflicts
+  # adminer:
+  #   image: adminer
+  #   restart: always
+  #   ports:
+  #     - "18081:8080"
+  #   depends_on:
+  #     - cortex-db
+
+volumes:
+  cortex_data:

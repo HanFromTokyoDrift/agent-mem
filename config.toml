@@ -1,0 +1,34 @@
+[general]
+# 留空则自动使用主机名
+machine_id = ""
+# SQLite 数据库位置
+base_dir = "."
+db_path = "out/agent_mem.db"
+scan_interval_seconds = 60
+max_file_size_kb = 2048
+
+[project]
+# 需要扫描的根目录
+roots = ["/home/junknet/projects"]
+# 识别项目根的标记文件/目录
+markers = [".git", ".project.yaml"]
+# .project.yaml 中的项目字段名
+project_id_key = "project_id"
+
+[include]
+# 仅扫描这些目录下的文档
+# 注意：目录名匹配不区分大小写
+dirs = ["docs", "doc", "specs", "spec", "requirements", "progress", "notes"]
+# 项目根目录下允许的文件名
+root_files = ["README.md", "TASKS.md", "CHANGELOG.md"]
+# 允许的文档扩展名
+exts = [".md", ".markdown", ".txt", ".rst", ".adoc", ".org", ".yml", ".yaml", ".json"]
+
+[exclude]
+# 排除目录（名称匹配）
+dirs = [".git", "node_modules", "dist", "build", "out", "tmp", ".venv", ".idea", ".vscode"]
+# 排除文件名
+files = [".env"]
+# 排除通配
+# 仅用于文件名匹配，不包含路径
+globs = ["*.key", "*.pem", "*.log"]

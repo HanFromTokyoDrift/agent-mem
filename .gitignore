@@ -1,0 +1,41 @@
+# --- Environments & Secrets ---
+.env
+.env.*
+*.env
+config/*.secret.yaml
+**/*_private.pem
+**/*_private.key
+
+# --- Build Artifacts ---
+/out/
+/bin/
+*.exe
+*.dll
+*.so
+*.dylib
+mcp-go/cmd/agent-mem-mcp/agent-mem-mcp
+
+# --- Runtime Data & Logs ---
+/data/
+/logs/
+/tmp/
+*.log
+*.sqlite
+*.db
+
+# --- Dependencies & Caches ---
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.pytest_cache/
+
+# Go
+vendor/
+
+# --- IDEs & OS ---
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db

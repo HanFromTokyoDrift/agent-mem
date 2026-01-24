@@ -1,0 +1,136 @@
+# Agent Memory System Configuration
+# 记忆系统配置
+
+# 项目识别规则
+project:
+  # 识别项目根的标记文件（按优先级）
+  root_markers:
+    - .git
+    - .project.yaml
+    - package.json
+    - pyproject.toml
+    - Cargo.toml
+    - go.mod
+  # .project.yaml 中的字段名
+  project_id_key: project_id
+  project_name_key: project_name
+  # 无法识别项目时的默认项目
+  default_project_id: global
+
+# 文档监控配置
+watcher:
+  # 监控的根目录（会自动向下识别项目）
+  roots: []
+  # 额外的对话历史根目录（非项目也会监听）
+  extra_roots: []
+  # 防抖时间（秒）
+  debounce_seconds: 2
+  # 最大文件大小（KB），超过则跳过
+  max_file_size_kb: 2048
+
+  # 监控的目录模式（相对于项目根）
+  watch_dirs:
+    - docs
+    - doc
+    - specs
+    - requirements
+    - progress
+    - notes
+    - design
+    - architecture
+    - insights
+    - lessons
+    - postmortem
+    - chat_history
+
+  # 监控的根目录文件
+  watch_root_files:
+    - README.md
+    - README.txt
+    - TASKS.md
+    - CHANGELOG.md
+    - TODO.md
+    - NOTES.md
+    - DESIGN.md
+    - ARCHITECTURE.md
+
+  # 监控的文件扩展名
+  extensions:
+    - .md
+    - .txt
+    - .rst
+    - .adoc
+    - .org
+    - .yaml
+    - .yml
+    - .json
+
+  # 忽略的目录
+  ignore_dirs:
+    - .git
+    - node_modules
+    - __pycache__
+    - .venv
+    - venv
+    - env
+    - dist
+    - build
+    - target
+    - .idea
+    - .vscode
+    - .pytest_cache
+
+  # 忽略的文件模式
+  ignore_patterns:
+    - "*.log"
+    - "*.tmp"
+    - "*.bak"
+    - ".DS_Store"
+    - "*.lock"
+    - "*.swp"
+
+# 版本管理
+versioning:
+  # 保留策略：all（全部保留）| count（保留最近N个）| days（保留最近N天）
+  strategy: all
+  keep_count: 10
+  keep_days: 180
+  archive_old: true
+  # 语义相似阈值（用于替换仲裁）
+  semantic_similarity_threshold: 0.85
+
+# LLM 配置（千问全家桶）
+llm:
+  base_url: https://dashscope.aliyuncs.com/compatible-mode/v1
+  api_key_env: DASHSCOPE_API_KEY
+  model_distill: qwen-plus
+  model_classify: qwen-turbo
+  model_route: qwen-turbo
+  model_relation: qwen-turbo
+  model_arbitrate: qwen-flash
+  model_summary: qwen-turbo
+
+# Embedding 配置
+embedding:
+  # provider: qwen (千问向量) | fastembed (本地向量)
+  provider: qwen
+  model: text-embedding-v4
+  dimension: 1024
+  batch_size: 32
+
+# 重排序配置（可选）
+rerank:
+  enabled: false
+  model: gte-rerank-v2
+  top_n: 10
+
+# 存储配置
+storage:
+  # PostgreSQL + pgvector
+  database_url: postgresql+psycopg://cortex:cortex_password_secure@localhost:5440/cortex_knowledge
+
+# 日志配置
+logging:
+  level: INFO
+  format: "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
+  file: ./data/agent-mem.log
