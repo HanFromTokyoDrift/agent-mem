@@ -36,13 +36,68 @@ func TestValidateIngestInput(t *testing.T) {
 
 func TestChunkingFixedTokens(t *testing.T) {
 	cfg := ChunkingConfig{ChunkSize: 500, Overlap: 50, ApproxCharsPerToken: 4}
-	content := strings.Repeat("a", 2100)
+	// Target: 2000, Max: 2500
+	// Case 1: 2100 chars (within elastic buffer) -> 1 chunk
+	content1 := strings.Repeat("a", 2100)
+	chunks1 := chunkContent(content1, cfg)
+	if len(chunks1) != 1 {
+		t.Fatalf("Case 1: 期望 1 个片段 (弹性缓冲)，实际为 %d", len(chunks1))
+	}
+
+	// Case 2: 2600 chars (exceeds max buffer) -> 2 chunks
+	content2 := strings.Repeat("a", 2600)
+	chunks2 := chunkContent(content2, cfg)
+	if len(chunks2) != 2 {
+		t.Fatalf("Case 2: 期望 2 个片段 (硬切分)，实际为 %d", len(chunks2))
+	}
+}
+
+func TestChunkingMarkdown(t *testing.T) {
+	cfg := ChunkingConfig{ChunkSize: 100, Overlap: 0, ApproxCharsPerToken: 1}
+	// Target: 100, Max: 125
+	// Construct content with natural split point around 100
+	part1 := strings.Repeat("a", 90)
+	part2 := "\n\n" // Natural split priority 1
+	part3 := strings.Repeat("b", 50)
+	content := part1 + part2 + part3 // Total 142 > 125, must split
+	
 	chunks := chunkContent(content, cfg)
 	if len(chunks) != 2 {
 		t.Fatalf("期望切分为 2 个片段，实际为 %d", len(chunks))
 	}
-	if len([]rune(chunks[0])) != 2000 {
-		t.Fatalf("首片段长度错误: %d", len([]rune(chunks[0])))
+	
+	// Should split at \n\n
+	// strings.TrimSpace removes the trailing \n\n from chunk 0
+	if len(chunks[0]) != 90 { 
+		t.Fatalf("切分点错误，Chunk 0 长度应为 90 (Trimmed)，实际为 %d", len(chunks[0]))
+	}
+	if !strings.HasSuffix(chunks[0], "a") {
+		t.Fatalf("Chunk 0 应以 'a' 结尾")
+	}
+	if !strings.HasPrefix(chunks[1], "b") {
+		t.Fatalf("Chunk 1 应以 'b' 开头")
+	}
+}
+
+func TestChunkingOverlapContinuity(t *testing.T) {
+	cfg := ChunkingConfig{ChunkSize: 10, Overlap: 2, ApproxCharsPerToken: 1}
+	// 无自然分割点，确保触发强制切分 + overlap
+	content := strings.Repeat("连续文本", 30)
+	chunks := chunkContent(content, cfg)
+	if len(chunks) < 2 {
+		t.Fatalf("期望至少 2 个片段，实际为 %d", len(chunks))
+	}
+	for i := 0; i < len(chunks)-1; i++ {
+		prev := []rune(chunks[i])
+		next := []rune(chunks[i+1])
+		if len(prev) < 2 || len(next) < 2 {
+			t.Fatalf("片段长度不足，无法验证连续性")
+		}
+		suffix := string(prev[len(prev)-2:])
+		prefix := string(next[:2])
+		if suffix != prefix {
+			t.Fatalf("连续性被破坏：chunk %d 后缀 '%s' 与 chunk %d 前缀 '%s' 不一致", i, suffix, i+1, prefix)
+		}
 	}
 }
 

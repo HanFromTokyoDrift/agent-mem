@@ -17,14 +17,16 @@ const (
 )
 
 type Settings struct {
-	Project     ProjectConfig     `yaml:"project"`
-	Versioning  VersioningConfig  `yaml:"versioning"`
-	LLM         LLMConfig         `yaml:"llm"`
-	Embedding   EmbeddingConfig   `yaml:"embedding"`
-	Rerank      RerankConfig      `yaml:"rerank"`
-	QueryExpand QueryExpandConfig `yaml:"query_expansion"`
-	Chunking    ChunkingConfig    `yaml:"chunking"`
-	Storage     StorageConfig     `yaml:"storage"`
+	Project       ProjectConfig       `yaml:"project"`
+	Versioning    VersioningConfig    `yaml:"versioning"`
+	LLM           LLMConfig           `yaml:"llm"`
+	Embedding     EmbeddingConfig     `yaml:"embedding"`
+	Rerank        RerankConfig        `yaml:"rerank"`
+	QueryExpand   QueryExpandConfig   `yaml:"query_expansion"`
+	Indexing      IndexingConfig      `yaml:"indexing"`
+	SearchExplain SearchExplainConfig `yaml:"search_explain"`
+	Chunking      ChunkingConfig      `yaml:"chunking"`
+	Storage       StorageConfig       `yaml:"storage"`
 }
 
 type ProjectConfig struct {
@@ -69,6 +71,16 @@ type QueryExpandConfig struct {
 	MaxKeywords int    `yaml:"max_keywords"`
 }
 
+type IndexingConfig struct {
+	Enabled      bool   `yaml:"enabled"`
+	Model        string `yaml:"model"`
+	PreferClient bool   `yaml:"prefer_client"`
+}
+
+type SearchExplainConfig struct {
+	Enabled bool `yaml:"enabled"`
+}
+
 type ChunkingConfig struct {
 	Strategy            string `yaml:"strategy"`
 	ChunkSize           int    `yaml:"chunk_size"`
@@ -109,6 +121,12 @@ func defaultSettings() Settings {
 			Model:       "qwen-turbo",
 			MaxKeywords: 6,
 		},
+		Indexing: IndexingConfig{
+			Enabled:      false,
+			Model:        "qwen-turbo",
+			PreferClient: true,
+		},
+		SearchExplain: SearchExplainConfig{Enabled: false},
 		Chunking: ChunkingConfig{
 			Strategy:            "fixed_tokens",
 			ChunkSize:           500,
@@ -155,6 +173,11 @@ func loadSettings(configPath string) (Settings, error) {
 	if envDim := os.Getenv("AGENT_MEM_EMBEDDING_DIMENSION"); envDim != "" {
 		if value, err := strconv.Atoi(envDim); err == nil && value > 0 {
 			settings.Embedding.Dimension = value
+		}
+	}
+	if envThreshold := os.Getenv("AGENT_MEM_SEMANTIC_SIMILARITY_THRESHOLD"); envThreshold != "" {
+		if value, err := strconv.ParseFloat(envThreshold, 64); err == nil && value >= 0 && value <= 1 {
+			settings.Versioning.SemanticSimilarityThreshold = value
 		}
 	}
 	if strings.TrimSpace(settings.Project.OwnerID) == "" {

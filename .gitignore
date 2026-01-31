@@ -5,8 +5,10 @@ AGENTS.md
 
 # --- Environments & Secrets ---
 .env
-.env.*
+.env.local
+.env.*.local
 *.env
+!.env.example
 config/*.secret.yaml
 **/*_private.pem
 **/*_private.key

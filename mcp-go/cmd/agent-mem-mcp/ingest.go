@@ -37,12 +37,64 @@ func (a *App) IngestMemory(ctx context.Context, input IngestMemoryInput) (Ingest
 	}
 
 	contentHash := hashContent(input.Content)
+	duplicateID, err := a.store.FindDuplicateMemory(ctx, project.ID, contentHash, 0)
+	if err != nil {
+		return IngestResult{}, fmt.Errorf("重复内容检查失败: %w", err)
+	}
+	if duplicateID != "" {
+		if err := a.store.UpdateMemoryTimestamp(ctx, duplicateID, input.Ts); err != nil {
+			return IngestResult{}, fmt.Errorf("更新重复内容时间失败: %w", err)
+		}
+		return IngestResult{ID: duplicateID, Status: "duplicate"}, nil
+	}
 
-	summary := a.llm.Summarize(input.Content)
+	summary := strings.TrimSpace(input.Summary)
+	tags := normalizeTags(input.Tags)
+	contentTrimmed := strings.TrimSpace(input.Content)
+	skipLLM := input.SkipLLM || len([]rune(contentTrimmed)) <= 120
+	if !skipLLM {
+		if summary == "" {
+			summary = a.llm.Summarize(input.Content)
+		}
+		if len(tags) == 0 {
+			tags = a.llm.ExtractTags(input.Content)
+		}
+	}
 	if summary == "" {
 		summary = fallbackSummary(input.Content)
 	}
-	tags := a.llm.ExtractTags(input.Content)
+	if len(tags) == 0 {
+		tags = fallbackTags(input.Content)
+	}
+
+	axes := MemoryAxes{}
+	if input.Axes != nil {
+		axes = *input.Axes
+	}
+	indexPath := input.IndexPath
+	if a.settings.Indexing.Enabled && !skipLLM {
+		needExtract := !a.settings.Indexing.PreferClient || axesEmpty(axes) || len(indexPath) == 0
+		extractedAxes := MemoryAxes{}
+		var extractedPath []string
+		if needExtract {
+			extractedAxes, extractedPath = a.llm.ExtractIndex(input.ContentType, summary, tags, input.Content)
+		}
+		if a.settings.Indexing.PreferClient {
+			if axesEmpty(axes) {
+				axes = extractedAxes
+			}
+			if len(indexPath) == 0 {
+				indexPath = extractedPath
+			}
+		} else {
+			if !axesEmpty(extractedAxes) {
+				axes = extractedAxes
+			}
+			if len(extractedPath) > 0 {
+				indexPath = extractedPath
+			}
+		}
+	}
 
 	chunks := chunkContent(input.Content, a.settings.Chunking)
 	if len(chunks) == 0 {
@@ -126,6 +178,8 @@ func (a *App) IngestMemory(ctx context.Context, input IngestMemoryInput) (Ingest
 		Ts:           input.Ts,
 		Summary:      summary,
 		Tags:         tags,
+		Axes:         axes,
+		IndexPath:    indexPath,
 		ChunkCount:   len(chunks),
 		Embedded:     true,
 		AvgEmbedding: avgVector,
@@ -215,15 +269,19 @@ func (a *App) IngestMemory(ctx context.Context, input IngestMemoryInput) (Ingest
 
 func insertMemoryTx(ctx context.Context, tx pgxTx, memory MemoryInsert) error {
 	tagsJSON, _ := json.Marshal(memory.Tags)
+	axesJSON, _ := json.Marshal(memory.Axes)
+	indexPathJSON, _ := json.Marshal(memory.IndexPath)
 	var avgVec any
 	if len(memory.AvgEmbedding) > 0 {
 		avgVec = pgvector.NewVector(memory.AvgEmbedding)
 	}
+	axesValue := nullableJSON(axesJSON, axesEmpty(memory.Axes))
+	indexPathValue := nullableJSON(indexPathJSON, len(memory.IndexPath) == 0)
 	_, err := tx.Exec(ctx, `
 INSERT INTO memories (
   id, project_id, content_type, content, content_hash, ts,
-  summary, tags, chunk_count, embedding_done, avg_embedding
-) VALUES ($1,$2,$3,$4,$5,$6,$7,$8::jsonb,$9,$10,$11)`,
+  summary, tags, axes, index_path, chunk_count, embedding_done, avg_embedding
+) VALUES ($1,$2,$3,$4,$5,$6,$7,$8::jsonb,$9::jsonb,$10::jsonb,$11,$12,$13)`,
 		memory.ID,
 		memory.ProjectID,
 		memory.ContentType,
@@ -232,6 +290,8 @@ INSERT INTO memories (
 		memory.Ts,
 		nullableString(memory.Summary),
 		string(tagsJSON),
+		axesValue,
+		indexPathValue,
 		memory.ChunkCount,
 		memory.Embedded,
 		avgVec,
@@ -241,6 +301,8 @@ INSERT INTO memories (
 
 func updateMemoryTx(ctx context.Context, tx pgxTx, memory MemoryInsert) error {
 	tagsJSON, _ := json.Marshal(memory.Tags)
+	axesJSON, _ := json.Marshal(memory.Axes)
+	indexPathJSON, _ := json.Marshal(memory.IndexPath)
 	if strings.TrimSpace(memory.ID) == "" {
 		return errors.New("记忆ID为空")
 	}
@@ -248,6 +310,8 @@ func updateMemoryTx(ctx context.Context, tx pgxTx, memory MemoryInsert) error {
 	if len(memory.AvgEmbedding) > 0 {
 		avgVec = pgvector.NewVector(memory.AvgEmbedding)
 	}
+	axesValue := nullableJSON(axesJSON, axesEmpty(memory.Axes))
+	indexPathValue := nullableJSON(indexPathJSON, len(memory.IndexPath) == 0)
 	tag, err := tx.Exec(ctx, `
 UPDATE memories
 SET content_type = $2,
@@ -256,9 +320,11 @@ SET content_type = $2,
     ts = $5,
     summary = $6,
     tags = $7::jsonb,
-    chunk_count = $8,
-    embedding_done = $9,
-    avg_embedding = $10,
+    axes = $8::jsonb,
+    index_path = $9::jsonb,
+    chunk_count = $10,
+    embedding_done = $11,
+    avg_embedding = $12,
     updated_at = NOW()
 WHERE id = $1`,
 		memory.ID,
@@ -268,6 +334,8 @@ WHERE id = $1`,
 		memory.Ts,
 		nullableString(memory.Summary),
 		string(tagsJSON),
+		axesValue,
+		indexPathValue,
 		memory.ChunkCount,
 		memory.Embedded,
 		avgVec,
@@ -311,10 +379,10 @@ func insertMemoryVersionFromMemoryTx(ctx context.Context, tx pgxTx, memoryID str
 	tag, err := tx.Exec(ctx, `
 INSERT INTO memory_versions (
   memory_id, project_id, content_type, content, content_hash, ts,
-  summary, tags, chunk_count, avg_embedding, created_at, replaced_at
+  summary, tags, axes, index_path, chunk_count, avg_embedding, created_at, replaced_at
 )
 SELECT id, project_id, content_type, content, content_hash, ts,
-       summary, tags, chunk_count, avg_embedding, created_at, NOW()
+       summary, tags, axes, index_path, chunk_count, avg_embedding, created_at, NOW()
 FROM memories
 WHERE id = $1`, memoryID)
 	if err != nil {

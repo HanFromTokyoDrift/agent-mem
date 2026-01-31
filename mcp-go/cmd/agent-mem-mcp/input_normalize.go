@@ -10,6 +10,7 @@ const (
 	defaultTimelineDays      = 7
 	defaultTimelineLimit     = 20
 	defaultListProjectsLimit = 50
+	defaultIndexLimit        = 20
 )
 
 func normalizeIngestInput(input IngestMemoryInput, settings Settings, now time.Time) (IngestMemoryInput, error) {
@@ -27,6 +28,12 @@ func normalizeIngestInput(input IngestMemoryInput, settings Settings, now time.T
 	input.ProjectName = projectName
 	input.MachineName = strings.TrimSpace(input.MachineName)
 	input.ProjectPath = strings.TrimSpace(input.ProjectPath)
+	input.Summary = strings.TrimSpace(input.Summary)
+	if len(input.Tags) > 0 {
+		input.Tags = normalizeTags(input.Tags)
+	}
+	input.Axes = normalizeAxesInput(input.Axes)
+	input.IndexPath = normalizeIndexPath(input.IndexPath)
 
 	if input.Ts <= 0 {
 		input.Ts = now.Unix()
@@ -56,6 +63,10 @@ func normalizeSearchInput(input SearchInput, settings Settings) (SearchInput, er
 	if input.Scope == "" {
 		input.Scope = "all"
 	}
+	input.Profile = normalizeSearchProfile(input.Profile)
+	input.Mode = normalizeSearchMode(input.Mode)
+	input.Axes = normalizeAxesInput(input.Axes)
+	input.IndexPath = normalizeIndexPath(input.IndexPath)
 	if input.Limit <= 0 {
 		input.Limit = defaultSearchLimit
 	}
@@ -99,6 +110,63 @@ func normalizeListProjectsInput(input ListProjectsInput, settings Settings) (Lis
 		input.Limit = defaultListProjectsLimit
 	}
 	return input, nil
+}
+
+func normalizeIndexInput(input IndexInput, settings Settings) (IndexInput, error) {
+	ownerID, err := resolveOwnerID(input.OwnerID, settings)
+	if err != nil {
+		return input, err
+	}
+	input.OwnerID = ownerID
+	input.MachineName = strings.TrimSpace(input.MachineName)
+	input.ProjectPath = strings.TrimSpace(input.ProjectPath)
+
+	if hasProjectSelector(input.ProjectName, input.ProjectKey, input.ProjectPath) {
+		projectKey, projectName, err := resolveProjectIdentity(input.ProjectName, input.ProjectKey, input.ProjectPath)
+		if err != nil {
+			return input, err
+		}
+		input.ProjectKey = projectKey
+		input.ProjectName = projectName
+	}
+	input.IndexPath = normalizeIndexPath(input.IndexPath)
+
+	if input.Limit <= 0 {
+		input.Limit = defaultIndexLimit
+	}
+	if input.PathTreeDepth < 0 {
+		input.PathTreeDepth = 0
+	}
+	if input.PathTreeWidth < 0 {
+		input.PathTreeWidth = 0
+	}
+	return input, nil
+}
+
+func normalizeSearchProfile(value string) string {
+	switch strings.ToLower(strings.TrimSpace(value)) {
+	case "", "deep":
+		return "deep"
+	case "fast":
+		return "fast"
+	case "balanced":
+		return "balanced"
+	default:
+		return "deep"
+	}
+}
+
+func normalizeSearchMode(value string) string {
+	switch strings.ToLower(strings.TrimSpace(value)) {
+	case "", "compact":
+		return "compact"
+	case "ids":
+		return "ids"
+	case "full":
+		return "full"
+	default:
+		return "compact"
+	}
 }
 
 func resolveOwnerID(inputOwner string, settings Settings) (string, error) {

@@ -60,6 +60,16 @@ query_expansion:
   model: qwen-turbo
   max_keywords: 6
 
+# 纵横索引自动提取（可选）
+indexing:
+  enabled: false
+  model: qwen-turbo
+  prefer_client: true
+
+# 检索可解释性（返回 sources/rank/rrf_score 等）
+search_explain:
+  enabled: false
+
 # 片段切分配置
 chunking:
   strategy: fixed_tokens

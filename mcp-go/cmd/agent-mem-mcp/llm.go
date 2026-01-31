@@ -2,24 +2,58 @@ package main
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"strings"
+	"sync"
+	"time"
 	"unicode"
 )
 
 type LLMClient struct {
-	settings Settings
-	client   *QwenClient
-	mock     bool
+	settings     Settings
+	client       *QwenClient
+	mock         bool
+	mu           sync.Mutex
+	summaryCache map[string]cachedText
+	tagsCache    map[string]cachedTags
+	queryCache   map[string]cachedTags
+	indexCache   map[string]cachedIndex
 }
+
+type cachedText struct {
+	Value   string
+	Expires time.Time
+}
+
+type cachedTags struct {
+	Values  []string
+	Expires time.Time
+}
+
+type cachedIndex struct {
+	Axes    MemoryAxes
+	Path    []string
+	Expires time.Time
+}
+
+const (
+	llmCacheTTL        = 30 * time.Minute
+	llmCacheMaxEntries = 500
+)
 
 func NewLLMClient(settings Settings) *LLMClient {
 	mock := strings.ToLower(envOrDefault("AGENT_MEM_LLM_MODE", "")) == "mock"
 	return &LLMClient{
-		settings: settings,
-		client:   NewQwenClient(settings),
-		mock:     mock,
+		settings:     settings,
+		client:       NewQwenClient(settings),
+		mock:         mock,
+		summaryCache: map[string]cachedText{},
+		tagsCache:    map[string]cachedTags{},
+		queryCache:   map[string]cachedTags{},
+		indexCache:   map[string]cachedIndex{},
 	}
 }
 
@@ -27,22 +61,38 @@ func (l *LLMClient) Summarize(content string) string {
 	if l.mock {
 		return mockSummary(content)
 	}
+	model := strings.TrimSpace(l.settings.LLM.ModelSummary)
+	cacheKey := cacheKeyWithModel("summary", model, content)
+	if cached, ok := l.getCachedText(l.summaryCache, cacheKey); ok {
+		return cached
+	}
 	prompt := "请将以下文档内容压缩为 3-5 句摘要，突出核心结论。\n\n内容：\n" + truncate(content, 12000)
-	raw, err := l.client.ChatCompletion(context.Background(), l.settings.LLM.ModelSummary, prompt, 0.2, 400)
+	raw, err := l.client.ChatCompletion(context.Background(), model, prompt, 0.2, 400)
 	if err != nil {
 		return ""
 	}
-	return strings.TrimSpace(raw)
+	result := strings.TrimSpace(raw)
+	if result != "" {
+		l.setCachedText(l.summaryCache, cacheKey, result)
+	}
+	return result
 }
 
 func (l *LLMClient) ExtractTags(content string) []string {
 	if l.mock {
 		return fallbackTags(content)
 	}
+	model := strings.TrimSpace(l.settings.LLM.ModelSummary)
+	cacheKey := cacheKeyWithModel("tags", model, content)
+	if cached, ok := l.getCachedTags(l.tagsCache, cacheKey); ok {
+		return cached
+	}
 	prompt := "请从以下文本中提取 3-10 个简短标签，输出 JSON 数组（字符串列表），不要输出其他内容。\n\n文本：\n" + truncate(content, 8000)
-	raw, err := l.client.ChatCompletion(context.Background(), l.settings.LLM.ModelSummary, prompt, 0.2, 200)
+	raw, err := l.client.ChatCompletion(context.Background(), model, prompt, 0.2, 200)
 	if err != nil {
-		return fallbackTags(content)
+		result := fallbackTags(content)
+		l.setCachedTags(l.tagsCache, cacheKey, result)
+		return result
 	}
 	cleaned := strings.TrimSpace(raw)
 	if strings.HasPrefix(cleaned, "```") {
@@ -51,7 +101,9 @@ func (l *LLMClient) ExtractTags(content string) []string {
 	}
 	var tags []string
 	if err := json.Unmarshal([]byte(cleaned), &tags); err == nil {
-		return normalizeTags(tags)
+		result := normalizeTags(tags)
+		l.setCachedTags(l.tagsCache, cacheKey, result)
+		return result
 	}
 	if parsed := parseJSONArray(raw); parsed != nil {
 		var fallback []string
@@ -62,9 +114,90 @@ func (l *LLMClient) ExtractTags(content string) []string {
 				}
 			}
 		}
-		return normalizeTags(fallback)
+		result := normalizeTags(fallback)
+		l.setCachedTags(l.tagsCache, cacheKey, result)
+		return result
 	}
-	return fallbackTags(raw)
+	result := fallbackTags(raw)
+	l.setCachedTags(l.tagsCache, cacheKey, result)
+	return result
+}
+
+func (l *LLMClient) ExtractIndex(contentType, summary string, tags []string, content string) (MemoryAxes, []string) {
+	if !l.settings.Indexing.Enabled {
+		return MemoryAxes{}, nil
+	}
+	if l.mock {
+		return MemoryAxes{}, nil
+	}
+	model := strings.TrimSpace(l.settings.Indexing.Model)
+	if model == "" {
+		model = strings.TrimSpace(l.settings.LLM.ModelClassify)
+	}
+	if model == "" {
+		model = l.settings.LLM.ModelSummary
+	}
+	cacheKey := cacheKeyWithModel("index", model, contentType+"|"+summary+"|"+strings.Join(tags, ",")+"|"+truncate(content, 1000))
+	if cached, ok := l.getCachedIndex(cacheKey); ok {
+		return cached.Axes, cached.Path
+	}
+
+	prompt := fmt.Sprintf(`你是记忆中心的索引器。请输出**机器友好**的纵横索引。
+
+要求：
+1) 只输出 JSON，不要输出其它内容。
+2) axes 每个字段输出 0-5 个短词；优先小写英文或简短中文词，禁止句子。
+3) index_path 输出 1-6 级目录路径，每个节点为短词；不要完整句子。
+4) 输出结构：
+{"axes":{"domain":[],"stack":[],"problem":[],"lifecycle":[],"component":[]},"index_path":[]}
+
+输入：
+content_type: %s
+summary: %s
+tags: %s
+content: %s`, contentType, truncate(summary, 2000), truncate(strings.Join(tags, ","), 500), truncate(content, 2000))
+
+	raw, err := l.client.ChatCompletion(context.Background(), model, prompt, 0.2, 300)
+	if err != nil {
+		return MemoryAxes{}, nil
+	}
+	data := parseJSON(raw)
+	if data == nil {
+		return MemoryAxes{}, nil
+	}
+
+	axes := extractAxesFromPayload(data)
+	indexPath := getStringSlice(data, "index_path")
+
+	normalizedAxes := normalizeAxesInput(&axes)
+	if normalizedAxes == nil {
+		resultPath := normalizeIndexPath(indexPath)
+		l.setCachedIndex(cacheKey, MemoryAxes{}, resultPath)
+		return MemoryAxes{}, resultPath
+	}
+	resultAxes := *normalizedAxes
+	resultPath := normalizeIndexPath(indexPath)
+	l.setCachedIndex(cacheKey, resultAxes, resultPath)
+	return resultAxes, resultPath
+}
+
+func extractAxesFromPayload(payload map[string]any) MemoryAxes {
+	if axesData, ok := payload["axes"]; ok {
+		if axesMap, ok := axesData.(map[string]any); ok {
+			return axesFromMap(axesMap)
+		}
+	}
+	return axesFromMap(payload)
+}
+
+func axesFromMap(data map[string]any) MemoryAxes {
+	return MemoryAxes{
+		Domain:    getStringSlice(data, "domain"),
+		Stack:     getStringSlice(data, "stack"),
+		Problem:   getStringSlice(data, "problem"),
+		Lifecycle: getStringSlice(data, "lifecycle"),
+		Component: getStringSlice(data, "component"),
+	}
 }
 
 func (l *LLMClient) ExpandQuery(query string) []string {
@@ -82,6 +215,10 @@ func (l *LLMClient) ExpandQuery(query string) []string {
 	if maxKeywords <= 0 {
 		maxKeywords = 6
 	}
+	cacheKey := cacheKeyWithModel("query", model, fmt.Sprintf("%d|%s", maxKeywords, query))
+	if cached, ok := l.getCachedTags(l.queryCache, cacheKey); ok {
+		return cached
+	}
 	prompt := fmt.Sprintf("请将以下检索问题扩展为 %d 个以内的关键词或同义短语，输出 JSON 数组（字符串列表），不要输出其他内容。\\n\\n问题：\\n%s", maxKeywords, truncate(query, 2000))
 	raw, err := l.client.ChatCompletion(context.Background(), model, prompt, 0.2, 200)
 	if err != nil {
@@ -94,7 +231,9 @@ func (l *LLMClient) ExpandQuery(query string) []string {
 	}
 	var items []string
 	if err := json.Unmarshal([]byte(cleaned), &items); err == nil {
-		return limitTags(normalizeTags(items), maxKeywords)
+		result := limitTags(normalizeTags(items), maxKeywords)
+		l.setCachedTags(l.queryCache, cacheKey, result)
+		return result
 	}
 	if parsed := parseJSONArray(raw); parsed != nil {
 		var fallback []string
@@ -105,9 +244,223 @@ func (l *LLMClient) ExpandQuery(query string) []string {
 				}
 			}
 		}
-		return limitTags(normalizeTags(fallback), maxKeywords)
+		result := limitTags(normalizeTags(fallback), maxKeywords)
+		l.setCachedTags(l.queryCache, cacheKey, result)
+		return result
 	}
 	return fallbackQueryKeywords(query, maxKeywords)
+}
+
+func (l *LLMClient) getCachedText(cache map[string]cachedText, key string) (string, bool) {
+	if key == "" {
+		return "", false
+	}
+	now := time.Now()
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	entry, ok := cache[key]
+	if !ok {
+		return "", false
+	}
+	if entry.Expires.Before(now) {
+		delete(cache, key)
+		return "", false
+	}
+	return entry.Value, true
+}
+
+func (l *LLMClient) setCachedText(cache map[string]cachedText, key, value string) {
+	if key == "" || value == "" {
+		return
+	}
+	now := time.Now()
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if len(cache) >= llmCacheMaxEntries {
+		pruneTextCache(cache, now)
+	}
+	cache[key] = cachedText{
+		Value:   value,
+		Expires: now.Add(llmCacheTTL),
+	}
+}
+
+func (l *LLMClient) getCachedTags(cache map[string]cachedTags, key string) ([]string, bool) {
+	if key == "" {
+		return nil, false
+	}
+	now := time.Now()
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	entry, ok := cache[key]
+	if !ok {
+		return nil, false
+	}
+	if entry.Expires.Before(now) {
+		delete(cache, key)
+		return nil, false
+	}
+	return cloneStringSlice(entry.Values), true
+}
+
+func (l *LLMClient) setCachedTags(cache map[string]cachedTags, key string, values []string) {
+	if key == "" || len(values) == 0 {
+		return
+	}
+	now := time.Now()
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if len(cache) >= llmCacheMaxEntries {
+		pruneTagsCache(cache, now)
+	}
+	cache[key] = cachedTags{
+		Values:  cloneStringSlice(values),
+		Expires: now.Add(llmCacheTTL),
+	}
+}
+
+func (l *LLMClient) getCachedIndex(key string) (cachedIndex, bool) {
+	if key == "" {
+		return cachedIndex{}, false
+	}
+	now := time.Now()
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	entry, ok := l.indexCache[key]
+	if !ok {
+		return cachedIndex{}, false
+	}
+	if entry.Expires.Before(now) {
+		delete(l.indexCache, key)
+		return cachedIndex{}, false
+	}
+	return cachedIndex{
+		Axes:    cloneAxes(entry.Axes),
+		Path:    cloneStringSlice(entry.Path),
+		Expires: entry.Expires,
+	}, true
+}
+
+func (l *LLMClient) setCachedIndex(key string, axes MemoryAxes, path []string) {
+	if key == "" {
+		return
+	}
+	now := time.Now()
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if len(l.indexCache) >= llmCacheMaxEntries {
+		pruneIndexCache(l.indexCache, now)
+	}
+	l.indexCache[key] = cachedIndex{
+		Axes:    cloneAxes(axes),
+		Path:    cloneStringSlice(path),
+		Expires: now.Add(llmCacheTTL),
+	}
+}
+
+func pruneTextCache(cache map[string]cachedText, now time.Time) {
+	for key, entry := range cache {
+		if entry.Expires.Before(now) {
+			delete(cache, key)
+		}
+	}
+	pruneExcessEntries(len(cache), func() bool {
+		for key := range cache {
+			delete(cache, key)
+			if len(cache) <= cacheTargetSize() {
+				return true
+			}
+		}
+		return true
+	})
+}
+
+func pruneTagsCache(cache map[string]cachedTags, now time.Time) {
+	for key, entry := range cache {
+		if entry.Expires.Before(now) {
+			delete(cache, key)
+		}
+	}
+	pruneExcessEntries(len(cache), func() bool {
+		for key := range cache {
+			delete(cache, key)
+			if len(cache) <= cacheTargetSize() {
+				return true
+			}
+		}
+		return true
+	})
+}
+
+func pruneIndexCache(cache map[string]cachedIndex, now time.Time) {
+	for key, entry := range cache {
+		if entry.Expires.Before(now) {
+			delete(cache, key)
+		}
+	}
+	pruneExcessEntries(len(cache), func() bool {
+		for key := range cache {
+			delete(cache, key)
+			if len(cache) <= cacheTargetSize() {
+				return true
+			}
+		}
+		return true
+	})
+}
+
+func pruneExcessEntries(size int, evict func() bool) {
+	if size < llmCacheMaxEntries {
+		return
+	}
+	evict()
+}
+
+func cacheTargetSize() int {
+	if llmCacheMaxEntries <= 0 {
+		return 0
+	}
+	target := llmCacheMaxEntries - llmCacheMaxEntries/10
+	if target <= 0 {
+		target = 1
+	}
+	return target
+}
+
+func cacheKey(prefix, content string) string {
+	return prefix + ":" + hashString(content)
+}
+
+func cacheKeyWithModel(prefix, model, content string) string {
+	model = strings.TrimSpace(model)
+	if model == "" {
+		return cacheKey(prefix, content)
+	}
+	return prefix + ":" + hashString(model+"|"+content)
+}
+
+func hashString(value string) string {
+	sum := sha256.Sum256([]byte(value))
+	return hex.EncodeToString(sum[:])
+}
+
+func cloneStringSlice(values []string) []string {
+	if len(values) == 0 {
+		return nil
+	}
+	out := make([]string, len(values))
+	copy(out, values)
+	return out
+}
+
+func cloneAxes(axes MemoryAxes) MemoryAxes {
+	return MemoryAxes{
+		Domain:    cloneStringSlice(axes.Domain),
+		Stack:     cloneStringSlice(axes.Stack),
+		Problem:   cloneStringSlice(axes.Problem),
+		Lifecycle: cloneStringSlice(axes.Lifecycle),
+		Component: cloneStringSlice(axes.Component),
+	}
 }
 
 func (l *LLMClient) Rerank(query string, documents []string, topN int) ([]RerankResult, error) {

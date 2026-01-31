@@ -60,6 +60,18 @@ func validateIngestInput(input IngestMemoryInput) error {
 	if err := validateTimestamp(input.Ts); err != nil {
 		return err
 	}
+	if err := validateSummary(input.Summary); err != nil {
+		return err
+	}
+	if err := validateTags(input.Tags); err != nil {
+		return err
+	}
+	if err := validateAxes(input.Axes); err != nil {
+		return err
+	}
+	if err := validateIndexPath(input.IndexPath); err != nil {
+		return err
+	}
 	return nil
 }
 
@@ -100,8 +112,20 @@ func validateSearchInput(input SearchInput) error {
 	if input.Scope != "all" && !contentTypeSet[input.Scope] {
 		return newValidationError("invalid_request", "ERR_INVALID_SCOPE", "scope 无效", 400)
 	}
+	if err := validateSearchProfile(input.Profile); err != nil {
+		return err
+	}
+	if err := validateSearchMode(input.Mode); err != nil {
+		return err
+	}
 	if input.Limit < 1 || input.Limit > 100 {
 		return newValidationError("invalid_request", "ERR_INVALID_LIMIT", "limit 必须在 1-100 之间", 400)
+	}
+	if err := validateAxes(input.Axes); err != nil {
+		return err
+	}
+	if err := validateIndexPath(input.IndexPath); err != nil {
+		return err
 	}
 	return nil
 }
@@ -139,6 +163,39 @@ func validateListProjectsInput(input ListProjectsInput) error {
 	}
 	if input.Limit < 1 || input.Limit > 1000 {
 		return newValidationError("invalid_request", "ERR_INVALID_LIMIT", "limit 必须在 1-1000 之间", 400)
+	}
+	return nil
+}
+
+func validateIndexInput(input IndexInput) error {
+	if err := validateOwnerID(input.OwnerID); err != nil {
+		return err
+	}
+	if input.ProjectKey != "" || input.ProjectName != "" {
+		if err := validateProjectKey(input.ProjectKey); err != nil {
+			return err
+		}
+		if err := validateProjectName(input.ProjectName); err != nil {
+			return err
+		}
+	}
+	if err := validateMachineNameOptional(input.MachineName); err != nil {
+		return err
+	}
+	if err := validateProjectPathOptional(input.ProjectPath); err != nil {
+		return err
+	}
+	if err := validateIndexPath(input.IndexPath); err != nil {
+		return err
+	}
+	if input.Limit < 1 || input.Limit > 200 {
+		return newValidationError("invalid_request", "ERR_INVALID_LIMIT", "limit 必须在 1-200 之间", 400)
+	}
+	if input.PathTreeDepth < 0 || input.PathTreeDepth > maxIndexPathDepth {
+		return newValidationError("invalid_request", "ERR_INVALID_PATH_TREE_DEPTH", "path_tree_depth 必须在 0-10 之间", 400)
+	}
+	if input.PathTreeWidth < 0 || input.PathTreeWidth > 100 {
+		return newValidationError("invalid_request", "ERR_INVALID_PATH_TREE_WIDTH", "path_tree_width 必须在 0-100 之间", 400)
 	}
 	return nil
 }
@@ -246,6 +303,125 @@ func validateTimestamp(ts int64) error {
 	}
 	if ts > 9_000_000_000_000 {
 		return newValidationError("invalid_request", "ERR_INVALID_TS", "ts 超出有效范围", 400)
+	}
+	return nil
+}
+
+func validateSummary(summary string) error {
+	if strings.TrimSpace(summary) == "" {
+		return nil
+	}
+	if len([]rune(summary)) > 5000 {
+		return newValidationError("invalid_request", "ERR_INVALID_SUMMARY", "summary 过长", 400)
+	}
+	if containsControl(summary) {
+		return newValidationError("invalid_request", "ERR_INVALID_SUMMARY", "summary 包含非法字符", 400)
+	}
+	return nil
+}
+
+func validateTags(tags []string) error {
+	if len(tags) == 0 {
+		return nil
+	}
+	if len(tags) > 50 {
+		return newValidationError("invalid_request", "ERR_INVALID_TAGS", "tags 数量过多", 400)
+	}
+	for _, tag := range tags {
+		item := strings.TrimSpace(tag)
+		if item == "" {
+			continue
+		}
+		if len([]rune(item)) > 100 {
+			return newValidationError("invalid_request", "ERR_INVALID_TAGS", "tag 过长", 400)
+		}
+		if containsControl(item) {
+			return newValidationError("invalid_request", "ERR_INVALID_TAGS", "tag 包含非法字符", 400)
+		}
+	}
+	return nil
+}
+
+func validateSearchProfile(profile string) error {
+	switch profile {
+	case "", "balanced", "fast", "deep":
+		return nil
+	default:
+		return newValidationError("invalid_request", "ERR_INVALID_PROFILE", "profile 无效", 400)
+	}
+}
+
+func validateSearchMode(mode string) error {
+	switch mode {
+	case "", "full", "ids", "compact":
+		return nil
+	default:
+		return newValidationError("invalid_request", "ERR_INVALID_MODE", "mode 无效", 400)
+	}
+}
+
+func validateAxes(axes *MemoryAxes) error {
+	if axes == nil {
+		return nil
+	}
+	if err := validateAxisValues("domain", axes.Domain); err != nil {
+		return err
+	}
+	if err := validateAxisValues("stack", axes.Stack); err != nil {
+		return err
+	}
+	if err := validateAxisValues("problem", axes.Problem); err != nil {
+		return err
+	}
+	if err := validateAxisValues("lifecycle", axes.Lifecycle); err != nil {
+		return err
+	}
+	if err := validateAxisValues("component", axes.Component); err != nil {
+		return err
+	}
+	return nil
+}
+
+func validateAxisValues(axis string, values []string) error {
+	if len(values) == 0 {
+		return nil
+	}
+	if len(values) > maxAxisValues {
+		return newValidationError("invalid_request", "ERR_INVALID_AXES", axis+" 维度数量过多", 400)
+	}
+	for _, value := range values {
+		item := strings.TrimSpace(value)
+		if item == "" {
+			continue
+		}
+		if len([]rune(item)) > maxAxisValueLen {
+			return newValidationError("invalid_request", "ERR_INVALID_AXES", axis+" 维度过长", 400)
+		}
+		if containsControl(item) {
+			return newValidationError("invalid_request", "ERR_INVALID_AXES", axis+" 维度包含非法字符", 400)
+		}
+	}
+	return nil
+}
+
+func validateIndexPath(path []string) error {
+	if len(path) == 0 {
+		return nil
+	}
+	if len(path) > maxIndexPathDepth {
+		return newValidationError("invalid_request", "ERR_INVALID_INDEX_PATH", "index_path 过深", 400)
+	}
+	for _, value := range path {
+		item := strings.TrimSpace(value)
+		if item == "" {
+			continue
+		}
+		if len([]rune(item)) > maxIndexPathSegmentLen {
+			return newValidationError("invalid_request", "ERR_INVALID_INDEX_PATH", "index_path 节点过长", 400)
+		}
+		if containsControl(item) {
+			return newValidationError("invalid_request", "ERR_INVALID_INDEX_PATH", "index_path 包含非法字符", 400)
+		}
 	}
 	return nil
 }

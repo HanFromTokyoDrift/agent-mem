@@ -5,17 +5,25 @@ import (
 	"crypto/md5"
 	"fmt"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/pgvector/pgvector-go"
 )
 
 type Embedder struct {
-	provider  string
-	model     string
-	dimension int
-	batchSize int
-	client    *QwenClient
+	provider   string
+	model      string
+	dimension  int
+	batchSize  int
+	client     *QwenClient
+	mu         sync.Mutex
+	queryCache map[string]cachedVector
+}
+
+type cachedVector struct {
+	Value   []float32
+	Expires time.Time
 }
 
 func NewEmbedder(settings Settings) *Embedder {
@@ -24,21 +32,30 @@ func NewEmbedder(settings Settings) *Embedder {
 		provider = "qwen"
 	}
 	return &Embedder{
-		provider:  provider,
-		model:     settings.Embedding.Model,
-		dimension: settings.Embedding.Dimension,
-		batchSize: settings.Embedding.BatchSize,
-		client:    NewQwenClient(settings),
+		provider:   provider,
+		model:      settings.Embedding.Model,
+		dimension:  settings.Embedding.Dimension,
+		batchSize:  settings.Embedding.BatchSize,
+		client:     NewQwenClient(settings),
+		queryCache: map[string]cachedVector{},
 	}
 }
 
 func (e *Embedder) EmbedQuery(text string) (pgvector.Vector, error) {
+	cacheKey := e.cacheKey(text)
+	if cached, ok := e.getCachedVector(cacheKey); ok {
+		return pgvector.NewVector(cached), nil
+	}
 	vectors, err := e.embed(context.Background(), []string{text})
 	if err != nil {
 		return pgvector.NewVector([]float32{}), err
 	}
 	if len(vectors) == 0 {
 		return pgvector.NewVector(make([]float32, e.dimension)), nil
+	}
+	vector := vectors[0].Slice()
+	if len(vector) > 0 {
+		e.setCachedVector(cacheKey, vector)
 	}
 	return vectors[0], nil
 }
@@ -144,5 +161,79 @@ func (e *Embedder) mockEmbed(text string) []float32 {
 	for i := 0; i < e.dimension; i++ {
 		out[i] = base[i%len(base)]
 	}
+	return out
+}
+
+const (
+	embedCacheTTL        = 30 * time.Minute
+	embedCacheMaxEntries = 1000
+)
+
+func (e *Embedder) cacheKey(text string) string {
+	base := fmt.Sprintf("%s|%s|%d|%s", e.provider, e.model, e.dimension, text)
+	return "embed:" + hashContent(base)
+}
+
+func (e *Embedder) getCachedVector(key string) ([]float32, bool) {
+	if key == "" {
+		return nil, false
+	}
+	now := time.Now()
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	entry, ok := e.queryCache[key]
+	if !ok {
+		return nil, false
+	}
+	if entry.Expires.Before(now) {
+		delete(e.queryCache, key)
+		return nil, false
+	}
+	return cloneFloat32Slice(entry.Value), true
+}
+
+func (e *Embedder) setCachedVector(key string, value []float32) {
+	if key == "" || len(value) == 0 {
+		return
+	}
+	now := time.Now()
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	if len(e.queryCache) >= embedCacheMaxEntries {
+		pruneEmbedCache(e.queryCache, now)
+	}
+	e.queryCache[key] = cachedVector{
+		Value:   cloneFloat32Slice(value),
+		Expires: now.Add(embedCacheTTL),
+	}
+}
+
+func pruneEmbedCache(cache map[string]cachedVector, now time.Time) {
+	for key, entry := range cache {
+		if entry.Expires.Before(now) {
+			delete(cache, key)
+		}
+	}
+	if len(cache) < embedCacheMaxEntries {
+		return
+	}
+	target := embedCacheMaxEntries - embedCacheMaxEntries/10
+	if target <= 0 {
+		target = 1
+	}
+	for key := range cache {
+		delete(cache, key)
+		if len(cache) <= target {
+			break
+		}
+	}
+}
+
+func cloneFloat32Slice(values []float32) []float32 {
+	if len(values) == 0 {
+		return nil
+	}
+	out := make([]float32, len(values))
+	copy(out, values)
 	return out
 }

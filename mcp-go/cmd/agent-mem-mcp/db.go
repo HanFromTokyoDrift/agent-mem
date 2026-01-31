@@ -37,6 +37,8 @@ type MemoryRow struct {
 	Content     string
 	Summary     string
 	Tags        []string
+	Axes        MemoryAxes
+	IndexPath   []string
 	Ts          int64
 }
 
@@ -103,6 +105,8 @@ CREATE TABLE IF NOT EXISTS memories (
   updated_at TIMESTAMPTZ DEFAULT NOW(),
   summary TEXT,
   tags JSONB,
+  axes JSONB,
+  index_path JSONB,
   chunk_count INT DEFAULT 1,
   embedding_done BOOLEAN DEFAULT false,
   avg_embedding VECTOR(%[1]d)
@@ -128,6 +132,8 @@ CREATE TABLE IF NOT EXISTS memory_versions (
   ts BIGINT NOT NULL,
   summary TEXT,
   tags JSONB,
+  axes JSONB,
+  index_path JSONB,
   chunk_count INT DEFAULT 1,
   avg_embedding VECTOR(%[1]d),
   created_at TIMESTAMPTZ,
@@ -209,6 +215,30 @@ CREATE TABLE IF NOT EXISTS memory_arbitrations (
 				ALTER TABLE memories ADD COLUMN tags JSONB;
 			END IF;
 		END $$`,
+		// memories 表添加 axes 字段
+		`DO $$ BEGIN
+			IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='memories' AND column_name='axes') THEN
+				ALTER TABLE memories ADD COLUMN axes JSONB;
+			END IF;
+		END $$`,
+		// memories 表添加 index_path 字段
+		`DO $$ BEGIN
+			IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='memories' AND column_name='index_path') THEN
+				ALTER TABLE memories ADD COLUMN index_path JSONB;
+			END IF;
+		END $$`,
+		// memory_versions 表添加 axes 字段
+		`DO $$ BEGIN
+			IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='memory_versions' AND column_name='axes') THEN
+				ALTER TABLE memory_versions ADD COLUMN axes JSONB;
+			END IF;
+		END $$`,
+		// memory_versions 表添加 index_path 字段
+		`DO $$ BEGIN
+			IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='memory_versions' AND column_name='index_path') THEN
+				ALTER TABLE memory_versions ADD COLUMN index_path JSONB;
+			END IF;
+		END $$`,
 	}
 	for _, stmt := range migrations {
 		if _, err := s.pool.Exec(ctx, stmt); err != nil {
@@ -228,6 +258,12 @@ CREATE TABLE IF NOT EXISTS memory_arbitrations (
 		"CREATE INDEX IF NOT EXISTS idx_memories_ts ON memories(ts DESC)",
 		"CREATE INDEX IF NOT EXISTS idx_memories_hash ON memories(content_hash)",
 		"CREATE INDEX IF NOT EXISTS idx_memories_created ON memories(created_at DESC)",
+		"CREATE INDEX IF NOT EXISTS idx_memories_tags_gin ON memories USING GIN (tags)",
+		"CREATE INDEX IF NOT EXISTS idx_memories_axes_gin ON memories USING GIN (axes)",
+		"CREATE INDEX IF NOT EXISTS idx_memories_index_path_gin ON memories USING GIN (index_path)",
+		"CREATE INDEX IF NOT EXISTS idx_memories_index_path_l1 ON memories ((index_path->>0)) WHERE index_path IS NOT NULL",
+		"CREATE INDEX IF NOT EXISTS idx_memories_index_path_l2 ON memories ((index_path->>1)) WHERE index_path IS NOT NULL",
+		"CREATE INDEX IF NOT EXISTS idx_memories_index_path_l3 ON memories ((index_path->>2)) WHERE index_path IS NOT NULL",
 		"CREATE INDEX IF NOT EXISTS idx_memories_avg_embedding ON memories USING hnsw (avg_embedding vector_cosine_ops)",
 		"CREATE INDEX IF NOT EXISTS idx_fragments_memory ON fragments(memory_id)",
 		"CREATE INDEX IF NOT EXISTS idx_fragments_embedding ON fragments USING hnsw (embedding vector_cosine_ops)",
@@ -325,15 +361,19 @@ func (s *Store) UpdateMemoryTimestamp(ctx context.Context, memoryID string, ts i
 
 func (s *Store) InsertMemory(ctx context.Context, memory MemoryInsert) error {
 	tagsJSON, _ := json.Marshal(memory.Tags)
+	axesJSON, _ := json.Marshal(memory.Axes)
+	indexPathJSON, _ := json.Marshal(memory.IndexPath)
 	var avgVec any
 	if len(memory.AvgEmbedding) > 0 {
 		avgVec = pgvector.NewVector(memory.AvgEmbedding)
 	}
+	axesValue := nullableJSON(axesJSON, axesEmpty(memory.Axes))
+	indexPathValue := nullableJSON(indexPathJSON, len(memory.IndexPath) == 0)
 	_, err := s.pool.Exec(ctx, `
 INSERT INTO memories (
   id, project_id, content_type, content, content_hash, ts,
-  summary, tags, chunk_count, embedding_done, avg_embedding
-) VALUES ($1,$2,$3,$4,$5,$6,$7,$8::jsonb,$9,$10,$11)`,
+  summary, tags, axes, index_path, chunk_count, embedding_done, avg_embedding
+) VALUES ($1,$2,$3,$4,$5,$6,$7,$8::jsonb,$9::jsonb,$10::jsonb,$11,$12,$13)`,
 		memory.ID,
 		memory.ProjectID,
 		memory.ContentType,
@@ -342,6 +382,8 @@ INSERT INTO memories (
 		memory.Ts,
 		nullableString(memory.Summary),
 		string(tagsJSON),
+		axesValue,
+		indexPathValue,
 		memory.ChunkCount,
 		memory.Embedded,
 		avgVec,
@@ -375,7 +417,7 @@ func (s *Store) FetchMemories(ctx context.Context, ids []string) ([]MemoryRow, e
 		return []MemoryRow{}, nil
 	}
 	query := `
-SELECT id, content_type, content, COALESCE(summary, ''), COALESCE(tags, '[]'::jsonb), ts
+SELECT id, content_type, content, COALESCE(summary, ''), COALESCE(tags, '[]'::jsonb), COALESCE(axes, '{}'::jsonb), COALESCE(index_path, '[]'::jsonb), ts
 FROM memories
 WHERE id = ANY($1)`
 	rows, err := s.pool.Query(ctx, query, ids)
@@ -389,11 +431,15 @@ WHERE id = ANY($1)`
 		var (
 			row      MemoryRow
 			tagsJSON []byte
+			axesJSON []byte
+			pathJSON []byte
 		)
-		if err := rows.Scan(&row.ID, &row.ContentType, &row.Content, &row.Summary, &tagsJSON, &row.Ts); err != nil {
+		if err := rows.Scan(&row.ID, &row.ContentType, &row.Content, &row.Summary, &tagsJSON, &axesJSON, &pathJSON, &row.Ts); err != nil {
 			return nil, err
 		}
 		row.Tags = decodeTags(tagsJSON)
+		row.Axes = decodeAxes(axesJSON)
+		row.IndexPath = decodeIndexPath(pathJSON)
 		results = append(results, row)
 	}
 	return results, rows.Err()
@@ -409,6 +455,8 @@ SELECT id,
        ts,
        COALESCE(summary, ''),
        COALESCE(tags, '[]'::jsonb),
+       COALESCE(axes, '{}'::jsonb),
+       COALESCE(index_path, '[]'::jsonb),
        chunk_count,
        COALESCE(avg_embedding::text, ''),
        created_at
@@ -417,6 +465,8 @@ WHERE id = $1`
 	var (
 		row      MemorySnapshot
 		tagsJSON []byte
+		axesJSON []byte
+		pathJSON []byte
 		avgText  string
 	)
 	if err := s.pool.QueryRow(ctx, query, memoryID).Scan(
@@ -428,6 +478,8 @@ WHERE id = $1`
 		&row.Ts,
 		&row.Summary,
 		&tagsJSON,
+		&axesJSON,
+		&pathJSON,
 		&row.ChunkCount,
 		&avgText,
 		&row.CreatedAt,
@@ -435,6 +487,8 @@ WHERE id = $1`
 		return MemorySnapshot{}, err
 	}
 	row.Tags = decodeTags(tagsJSON)
+	row.Axes = decodeAxes(axesJSON)
+	row.IndexPath = decodeIndexPath(pathJSON)
 	if strings.TrimSpace(avgText) != "" {
 		var vec pgvector.Vector
 		if err := vec.Parse(avgText); err == nil {
@@ -446,15 +500,19 @@ WHERE id = $1`
 
 func (s *Store) InsertMemoryVersion(ctx context.Context, version MemoryVersionInsert) error {
 	tagsJSON, _ := json.Marshal(version.Tags)
+	axesJSON, _ := json.Marshal(version.Axes)
+	indexPathJSON, _ := json.Marshal(version.IndexPath)
 	var avgVec any
 	if len(version.AvgEmbedding) > 0 {
 		avgVec = pgvector.NewVector(version.AvgEmbedding)
 	}
+	axesValue := nullableJSON(axesJSON, axesEmpty(version.Axes))
+	indexPathValue := nullableJSON(indexPathJSON, len(version.IndexPath) == 0)
 	_, err := s.pool.Exec(ctx, `
 INSERT INTO memory_versions (
   memory_id, project_id, content_type, content, content_hash, ts,
-  summary, tags, chunk_count, avg_embedding, created_at, replaced_at
-) VALUES ($1,$2,$3,$4,$5,$6,$7,$8::jsonb,$9,$10,$11,$12)`,
+  summary, tags, axes, index_path, chunk_count, avg_embedding, created_at, replaced_at
+) VALUES ($1,$2,$3,$4,$5,$6,$7,$8::jsonb,$9::jsonb,$10::jsonb,$11,$12,$13,$14)`,
 		version.MemoryID,
 		version.ProjectID,
 		version.ContentType,
@@ -463,6 +521,8 @@ INSERT INTO memory_versions (
 		version.Ts,
 		nullableString(version.Summary),
 		string(tagsJSON),
+		axesValue,
+		indexPathValue,
 		version.ChunkCount,
 		avgVec,
 		version.CreatedAt,
@@ -624,17 +684,22 @@ LIMIT $3`
 	return results, rows.Err()
 }
 
-func (s *Store) SearchVectorFragments(ctx context.Context, vector pgvector.Vector, projectID, scope string, limit int) ([]FragmentRow, error) {
+func (s *Store) SearchVectorFragments(ctx context.Context, vector pgvector.Vector, projectID, scope string, axes MemoryAxes, indexPath []string, limit int) ([]FragmentRow, error) {
 	query := `
-SELECT f.id, f.memory_id, f.chunk_index, f.content, m.content_type, m.ts, m.chunk_count, (f.embedding <=> $1) AS distance
+SELECT f.id, f.memory_id, f.chunk_index, f.content, m.content_type, p.project_key, m.ts, m.chunk_count,
+       COALESCE(m.axes, '{}'::jsonb), COALESCE(m.index_path, '[]'::jsonb),
+       (f.embedding <=> $1) AS distance
 FROM fragments f
 JOIN memories m ON f.memory_id = m.id
+JOIN projects p ON m.project_id = p.id
 WHERE m.project_id = $2`
 	args := []any{vector, projectID}
 	if scope != "all" && scope != "" {
 		query += " AND m.content_type = $3"
 		args = append(args, scope)
 	}
+	query, args = appendAxesFilter(query, args, axes)
+	query, args = appendIndexPathFilter(query, args, indexPath)
 	query += " ORDER BY f.embedding <=> $1 LIMIT $" + fmt.Sprintf("%d", len(args)+1)
 	args = append(args, limit)
 
@@ -646,9 +711,11 @@ WHERE m.project_id = $2`
 	return scanFragmentRows(rows)
 }
 
-func (s *Store) SearchVectorFragmentsByOwner(ctx context.Context, vector pgvector.Vector, ownerID, scope string, limit int) ([]FragmentRow, error) {
+func (s *Store) SearchVectorFragmentsByOwner(ctx context.Context, vector pgvector.Vector, ownerID, scope string, axes MemoryAxes, indexPath []string, limit int) ([]FragmentRow, error) {
 	query := `
-SELECT f.id, f.memory_id, f.chunk_index, f.content, m.content_type, m.ts, m.chunk_count, (f.embedding <=> $1) AS distance
+SELECT f.id, f.memory_id, f.chunk_index, f.content, m.content_type, p.project_key, m.ts, m.chunk_count,
+       COALESCE(m.axes, '{}'::jsonb), COALESCE(m.index_path, '[]'::jsonb),
+       (f.embedding <=> $1) AS distance
 FROM fragments f
 JOIN memories m ON f.memory_id = m.id
 JOIN projects p ON m.project_id = p.id
@@ -658,6 +725,8 @@ WHERE p.owner_id = $2`
 		query += " AND m.content_type = $3"
 		args = append(args, scope)
 	}
+	query, args = appendAxesFilter(query, args, axes)
+	query, args = appendIndexPathFilter(query, args, indexPath)
 	query += " ORDER BY f.embedding <=> $1 LIMIT $" + fmt.Sprintf("%d", len(args)+1)
 	args = append(args, limit)
 
@@ -669,17 +738,22 @@ WHERE p.owner_id = $2`
 	return scanFragmentRows(rows)
 }
 
-func (s *Store) SearchKeywordFragments(ctx context.Context, keyword, projectID, scope string, limit int) ([]FragmentRow, error) {
+func (s *Store) SearchKeywordFragments(ctx context.Context, keyword, projectID, scope string, axes MemoryAxes, indexPath []string, limit int) ([]FragmentRow, error) {
 	query := `
-SELECT f.id, f.memory_id, f.chunk_index, f.content, m.content_type, m.ts, m.chunk_count, 0 AS distance
+SELECT f.id, f.memory_id, f.chunk_index, f.content, m.content_type, p.project_key, m.ts, m.chunk_count,
+       COALESCE(m.axes, '{}'::jsonb), COALESCE(m.index_path, '[]'::jsonb),
+       0 AS distance
 FROM fragments f
 JOIN memories m ON f.memory_id = m.id
+JOIN projects p ON m.project_id = p.id
 WHERE m.project_id = $1 AND f.content ILIKE $2`
 	args := []any{projectID, fmt.Sprintf("%%%s%%", keyword)}
 	if scope != "all" && scope != "" {
 		query += " AND m.content_type = $3"
 		args = append(args, scope)
 	}
+	query, args = appendAxesFilter(query, args, axes)
+	query, args = appendIndexPathFilter(query, args, indexPath)
 	query += " ORDER BY m.ts DESC LIMIT $" + fmt.Sprintf("%d", len(args)+1)
 	args = append(args, limit)
 	rows, err := s.pool.Query(ctx, query, args...)
@@ -690,9 +764,11 @@ WHERE m.project_id = $1 AND f.content ILIKE $2`
 	return scanFragmentRows(rows)
 }
 
-func (s *Store) SearchKeywordFragmentsByOwner(ctx context.Context, keyword, ownerID, scope string, limit int) ([]FragmentRow, error) {
+func (s *Store) SearchKeywordFragmentsByOwner(ctx context.Context, keyword, ownerID, scope string, axes MemoryAxes, indexPath []string, limit int) ([]FragmentRow, error) {
 	query := `
-SELECT f.id, f.memory_id, f.chunk_index, f.content, m.content_type, m.ts, m.chunk_count, 0 AS distance
+SELECT f.id, f.memory_id, f.chunk_index, f.content, m.content_type, p.project_key, m.ts, m.chunk_count,
+       COALESCE(m.axes, '{}'::jsonb), COALESCE(m.index_path, '[]'::jsonb),
+       0 AS distance
 FROM fragments f
 JOIN memories m ON f.memory_id = m.id
 JOIN projects p ON m.project_id = p.id
@@ -702,6 +778,8 @@ WHERE p.owner_id = $1 AND f.content ILIKE $2`
 		query += " AND m.content_type = $3"
 		args = append(args, scope)
 	}
+	query, args = appendAxesFilter(query, args, axes)
+	query, args = appendIndexPathFilter(query, args, indexPath)
 	query += " ORDER BY m.ts DESC LIMIT $" + fmt.Sprintf("%d", len(args)+1)
 	args = append(args, limit)
 	rows, err := s.pool.Query(ctx, query, args...)
@@ -712,18 +790,22 @@ WHERE p.owner_id = $1 AND f.content ILIKE $2`
 	return scanFragmentRows(rows)
 }
 
-func (s *Store) SearchBM25Fragments(ctx context.Context, keyword, projectID, scope string, limit int) ([]FragmentRow, error) {
+func (s *Store) SearchBM25Fragments(ctx context.Context, keyword, projectID, scope string, axes MemoryAxes, indexPath []string, limit int) ([]FragmentRow, error) {
 	query := `
-SELECT f.id, f.memory_id, f.chunk_index, f.content, m.content_type, m.ts, m.chunk_count,
+SELECT f.id, f.memory_id, f.chunk_index, f.content, m.content_type, p.project_key, m.ts, m.chunk_count,
+       COALESCE(m.axes, '{}'::jsonb), COALESCE(m.index_path, '[]'::jsonb),
        ts_rank_cd(to_tsvector('simple', f.content), plainto_tsquery('simple', $2)) AS rank
 FROM fragments f
 JOIN memories m ON f.memory_id = m.id
+JOIN projects p ON m.project_id = p.id
 WHERE m.project_id = $1 AND to_tsvector('simple', f.content) @@ plainto_tsquery('simple', $2)`
 	args := []any{projectID, keyword}
 	if scope != "all" && scope != "" {
 		query += " AND m.content_type = $3"
 		args = append(args, scope)
 	}
+	query, args = appendAxesFilter(query, args, axes)
+	query, args = appendIndexPathFilter(query, args, indexPath)
 	query += " ORDER BY rank DESC LIMIT $" + fmt.Sprintf("%d", len(args)+1)
 	args = append(args, limit)
 
@@ -736,17 +818,22 @@ WHERE m.project_id = $1 AND to_tsvector('simple', f.content) @@ plainto_tsquery(
 	var results []FragmentRow
 	for rows.Next() {
 		var row FragmentRow
-		if err := rows.Scan(&row.FragmentID, &row.MemoryID, &row.ChunkIndex, &row.Content, &row.ContentType, &row.Ts, &row.ChunkCount, &row.RankScore); err != nil {
+		var axesJSON []byte
+		var pathJSON []byte
+		if err := rows.Scan(&row.FragmentID, &row.MemoryID, &row.ChunkIndex, &row.Content, &row.ContentType, &row.ProjectKey, &row.Ts, &row.ChunkCount, &axesJSON, &pathJSON, &row.RankScore); err != nil {
 			return nil, err
 		}
+		row.Axes = decodeAxes(axesJSON)
+		row.IndexPath = decodeIndexPath(pathJSON)
 		results = append(results, row)
 	}
 	return results, rows.Err()
 }
 
-func (s *Store) SearchBM25FragmentsByOwner(ctx context.Context, keyword, ownerID, scope string, limit int) ([]FragmentRow, error) {
+func (s *Store) SearchBM25FragmentsByOwner(ctx context.Context, keyword, ownerID, scope string, axes MemoryAxes, indexPath []string, limit int) ([]FragmentRow, error) {
 	query := `
-SELECT f.id, f.memory_id, f.chunk_index, f.content, m.content_type, m.ts, m.chunk_count,
+SELECT f.id, f.memory_id, f.chunk_index, f.content, m.content_type, p.project_key, m.ts, m.chunk_count,
+       COALESCE(m.axes, '{}'::jsonb), COALESCE(m.index_path, '[]'::jsonb),
        ts_rank_cd(to_tsvector('simple', f.content), plainto_tsquery('simple', $2)) AS rank
 FROM fragments f
 JOIN memories m ON f.memory_id = m.id
@@ -757,6 +844,8 @@ WHERE p.owner_id = $1 AND to_tsvector('simple', f.content) @@ plainto_tsquery('s
 		query += " AND m.content_type = $3"
 		args = append(args, scope)
 	}
+	query, args = appendAxesFilter(query, args, axes)
+	query, args = appendIndexPathFilter(query, args, indexPath)
 	query += " ORDER BY rank DESC LIMIT $" + fmt.Sprintf("%d", len(args)+1)
 	args = append(args, limit)
 
@@ -769,24 +858,250 @@ WHERE p.owner_id = $1 AND to_tsvector('simple', f.content) @@ plainto_tsquery('s
 	var results []FragmentRow
 	for rows.Next() {
 		var row FragmentRow
-		if err := rows.Scan(&row.FragmentID, &row.MemoryID, &row.ChunkIndex, &row.Content, &row.ContentType, &row.Ts, &row.ChunkCount, &row.RankScore); err != nil {
+		var axesJSON []byte
+		var pathJSON []byte
+		if err := rows.Scan(&row.FragmentID, &row.MemoryID, &row.ChunkIndex, &row.Content, &row.ContentType, &row.ProjectKey, &row.Ts, &row.ChunkCount, &axesJSON, &pathJSON, &row.RankScore); err != nil {
 			return nil, err
 		}
+		row.Axes = decodeAxes(axesJSON)
+		row.IndexPath = decodeIndexPath(pathJSON)
 		results = append(results, row)
 	}
 	return results, rows.Err()
+}
+
+func (s *Store) FetchTagCounts(ctx context.Context, projectID, ownerID string, limit int, indexPath []string) ([]AxisCount, error) {
+	query := `
+SELECT value, COUNT(*) FROM (
+  SELECT jsonb_array_elements_text(COALESCE(m.tags, '[]'::jsonb)) AS value
+  FROM memories m
+  JOIN projects p ON m.project_id = p.id
+  WHERE %s
+) t
+WHERE value <> ''
+GROUP BY value
+ORDER BY COUNT(*) DESC
+LIMIT $1`
+	where := "p.owner_id = $2"
+	args := []any{limit, ownerID}
+	if strings.TrimSpace(projectID) != "" {
+		where = "m.project_id = $2"
+		args[1] = projectID
+	}
+	where, args = appendIndexPathWhere(where, args, indexPath)
+	rows, err := s.pool.Query(ctx, fmt.Sprintf(query, where), args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var results []AxisCount
+	for rows.Next() {
+		var item AxisCount
+		if err := rows.Scan(&item.Value, &item.Count); err != nil {
+			return nil, err
+		}
+		results = append(results, item)
+	}
+	return results, rows.Err()
+}
+
+func (s *Store) FetchAxisCounts(ctx context.Context, projectID, ownerID, axis string, limit int, indexPath []string) ([]AxisCount, error) {
+	if !isAxisAllowed(axis) {
+		return nil, fmt.Errorf("axis 不支持")
+	}
+	query := `
+SELECT value, COUNT(*) FROM (
+  SELECT jsonb_array_elements_text(COALESCE(m.axes->'%s', '[]'::jsonb)) AS value
+  FROM memories m
+  JOIN projects p ON m.project_id = p.id
+  WHERE %s
+) t
+WHERE value <> ''
+GROUP BY value
+ORDER BY COUNT(*) DESC
+LIMIT $1`
+	where := "p.owner_id = $2"
+	args := []any{limit, ownerID}
+	if strings.TrimSpace(projectID) != "" {
+		where = "m.project_id = $2"
+		args[1] = projectID
+	}
+	where, args = appendIndexPathWhere(where, args, indexPath)
+	rows, err := s.pool.Query(ctx, fmt.Sprintf(query, axis, where), args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var results []AxisCount
+	for rows.Next() {
+		var item AxisCount
+		if err := rows.Scan(&item.Value, &item.Count); err != nil {
+			return nil, err
+		}
+		results = append(results, item)
+	}
+	return results, rows.Err()
+}
+
+func (s *Store) FetchIndexPaths(ctx context.Context, projectID, ownerID string, limit int, indexPath []string) ([]IndexPathCount, error) {
+	query := `
+SELECT m.index_path, COUNT(*) 
+FROM memories m
+JOIN projects p ON m.project_id = p.id
+WHERE %s AND m.index_path IS NOT NULL
+GROUP BY m.index_path
+ORDER BY COUNT(*) DESC
+LIMIT $1`
+	where := "p.owner_id = $2"
+	args := []any{limit, ownerID}
+	if strings.TrimSpace(projectID) != "" {
+		where = "m.project_id = $2"
+		args[1] = projectID
+	}
+	where, args = appendIndexPathWhere(where, args, indexPath)
+	rows, err := s.pool.Query(ctx, fmt.Sprintf(query, where), args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var results []IndexPathCount
+	for rows.Next() {
+		var raw []byte
+		var count int
+		if err := rows.Scan(&raw, &count); err != nil {
+			return nil, err
+		}
+		results = append(results, IndexPathCount{
+			Path:  decodeIndexPath(raw),
+			Count: count,
+		})
+	}
+	return results, rows.Err()
+}
+
+func (s *Store) FetchMemoryCounts(ctx context.Context, projectID, ownerID string, indexPath []string) (MemoryCounts, error) {
+	query := `
+SELECT COUNT(*) AS total,
+       COALESCE(SUM(CASE WHEN m.axes IS NOT NULL AND m.axes != '{}'::jsonb THEN 1 ELSE 0 END), 0) AS axes_count,
+       COALESCE(SUM(CASE WHEN m.index_path IS NOT NULL AND m.index_path != '[]'::jsonb THEN 1 ELSE 0 END), 0) AS path_count
+FROM memories m
+JOIN projects p ON m.project_id = p.id
+WHERE %s`
+	where := "p.owner_id = $1"
+	args := []any{ownerID}
+	if strings.TrimSpace(projectID) != "" {
+		where = "m.project_id = $1"
+		args[0] = projectID
+	}
+	where, args = appendIndexPathWhere(where, args, indexPath)
+	row := s.pool.QueryRow(ctx, fmt.Sprintf(query, where), args...)
+	var counts MemoryCounts
+	if err := row.Scan(&counts.Total, &counts.Axes, &counts.IndexPath); err != nil {
+		return MemoryCounts{}, err
+	}
+	return counts, nil
+}
+
+func (s *Store) FetchIndexPathDepthDistribution(ctx context.Context, projectID, ownerID string, indexPath []string) ([]DepthCount, error) {
+	query := `
+SELECT jsonb_array_length(m.index_path) AS depth, COUNT(*)
+FROM memories m
+JOIN projects p ON m.project_id = p.id
+WHERE %s AND m.index_path IS NOT NULL AND m.index_path != '[]'::jsonb
+GROUP BY depth
+ORDER BY depth`
+	where := "p.owner_id = $1"
+	args := []any{ownerID}
+	if strings.TrimSpace(projectID) != "" {
+		where = "m.project_id = $1"
+		args[0] = projectID
+	}
+	where, args = appendIndexPathWhere(where, args, indexPath)
+	rows, err := s.pool.Query(ctx, fmt.Sprintf(query, where), args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var results []DepthCount
+	for rows.Next() {
+		var item DepthCount
+		if err := rows.Scan(&item.Depth, &item.Count); err != nil {
+			return nil, err
+		}
+		results = append(results, item)
+	}
+	return results, rows.Err()
+}
+
+func isAxisAllowed(axis string) bool {
+	switch axis {
+	case "domain", "stack", "problem", "lifecycle", "component":
+		return true
+	default:
+		return false
+	}
 }
 
 func scanFragmentRows(rows pgx.Rows) ([]FragmentRow, error) {
 	var results []FragmentRow
 	for rows.Next() {
 		var row FragmentRow
-		if err := rows.Scan(&row.FragmentID, &row.MemoryID, &row.ChunkIndex, &row.Content, &row.ContentType, &row.Ts, &row.ChunkCount, &row.Distance); err != nil {
+		var axesJSON []byte
+		var pathJSON []byte
+		if err := rows.Scan(&row.FragmentID, &row.MemoryID, &row.ChunkIndex, &row.Content, &row.ContentType, &row.ProjectKey, &row.Ts, &row.ChunkCount, &axesJSON, &pathJSON, &row.Distance); err != nil {
 			return nil, err
 		}
+		row.Axes = decodeAxes(axesJSON)
+		row.IndexPath = decodeIndexPath(pathJSON)
 		results = append(results, row)
 	}
 	return results, rows.Err()
+}
+
+func appendAxesFilter(query string, args []any, axes MemoryAxes) (string, []any) {
+	query, args = appendAxisFilter(query, args, "domain", axes.Domain)
+	query, args = appendAxisFilter(query, args, "stack", axes.Stack)
+	query, args = appendAxisFilter(query, args, "problem", axes.Problem)
+	query, args = appendAxisFilter(query, args, "lifecycle", axes.Lifecycle)
+	query, args = appendAxisFilter(query, args, "component", axes.Component)
+	return query, args
+}
+
+func appendAxisFilter(query string, args []any, field string, values []string) (string, []any) {
+	if len(values) == 0 {
+		return query, args
+	}
+	query += " AND COALESCE(m.axes->'" + field + "', '[]'::jsonb) ?| $" + fmt.Sprintf("%d", len(args)+1)
+	args = append(args, values)
+	return query, args
+}
+
+func appendIndexPathFilter(query string, args []any, indexPath []string) (string, []any) {
+	if len(indexPath) == 0 {
+		return query, args
+	}
+	for idx, segment := range indexPath {
+		if strings.TrimSpace(segment) == "" {
+			continue
+		}
+		query += " AND m.index_path->>" + fmt.Sprintf("%d", idx) + " = $" + fmt.Sprintf("%d", len(args)+1)
+		args = append(args, segment)
+	}
+	return query, args
+}
+
+func appendIndexPathWhere(where string, args []any, indexPath []string) (string, []any) {
+	if len(indexPath) == 0 {
+		return where, args
+	}
+	for idx, segment := range indexPath {
+		if strings.TrimSpace(segment) == "" {
+			continue
+		}
+		where += " AND m.index_path->>" + fmt.Sprintf("%d", idx) + " = $" + fmt.Sprintf("%d", len(args)+1)
+		args = append(args, segment)
+	}
+	return where, args
 }
 
 func decodeTags(raw []byte) []string {
@@ -819,4 +1134,162 @@ func nullableString(value string) any {
 		return nil
 	}
 	return value
+}
+
+// === 仲裁历史与回滚 ===
+
+// FetchArbitrationHistory 查询仲裁历史
+func (s *Store) FetchArbitrationHistory(ctx context.Context, ownerID, memoryID, projectID string, limit int) ([]ArbitrationRecord, error) {
+	query := `
+SELECT id, COALESCE(candidate_memory_id, ''), COALESCE(new_memory_id, ''), action,
+       COALESCE(similarity, 0), COALESCE(old_summary, ''), COALESCE(new_summary, ''),
+       COALESCE(model, ''), EXTRACT(EPOCH FROM created_at)::BIGINT
+FROM memory_arbitrations
+WHERE owner_id = $1`
+	args := []any{ownerID}
+
+	if memoryID != "" {
+		query += " AND (candidate_memory_id = $2 OR new_memory_id = $2)"
+		args = append(args, memoryID)
+	}
+	if projectID != "" {
+		query += " AND project_id = $" + fmt.Sprintf("%d", len(args)+1)
+		args = append(args, projectID)
+	}
+	query += " ORDER BY created_at DESC LIMIT $" + fmt.Sprintf("%d", len(args)+1)
+	args = append(args, limit)
+
+	rows, err := s.pool.Query(ctx, query, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var results []ArbitrationRecord
+	for rows.Next() {
+		var r ArbitrationRecord
+		if err := rows.Scan(&r.ID, &r.CandidateMemoryID, &r.NewMemoryID, &r.Action,
+			&r.Similarity, &r.OldSummary, &r.NewSummary, &r.Model, &r.CreatedAt); err != nil {
+			return nil, err
+		}
+		results = append(results, r)
+	}
+	return results, rows.Err()
+}
+
+// FetchMemoryVersions 查询记忆的历史版本
+func (s *Store) FetchMemoryVersions(ctx context.Context, memoryID string) ([]MemoryVersion, error) {
+	query := `
+SELECT id, COALESCE(summary, ''), content_type, ts,
+       EXTRACT(EPOCH FROM replaced_at)::BIGINT
+FROM memory_versions
+WHERE memory_id = $1
+ORDER BY replaced_at DESC`
+
+	rows, err := s.pool.Query(ctx, query, memoryID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var results []MemoryVersion
+	for rows.Next() {
+		var v MemoryVersion
+		if err := rows.Scan(&v.VersionID, &v.Summary, &v.ContentType, &v.Ts, &v.ReplacedAt); err != nil {
+			return nil, err
+		}
+		results = append(results, v)
+	}
+	return results, rows.Err()
+}
+
+// FetchArbitrationByID 根据 ID 获取仲裁记录
+func (s *Store) FetchArbitrationByID(ctx context.Context, id int64) (ArbitrationRecord, error) {
+	query := `
+SELECT id, COALESCE(candidate_memory_id, ''), COALESCE(new_memory_id, ''), action,
+       COALESCE(similarity, 0), COALESCE(old_summary, ''), COALESCE(new_summary, ''),
+       COALESCE(model, ''), EXTRACT(EPOCH FROM created_at)::BIGINT
+FROM memory_arbitrations
+WHERE id = $1`
+
+	var r ArbitrationRecord
+	err := s.pool.QueryRow(ctx, query, id).Scan(&r.ID, &r.CandidateMemoryID, &r.NewMemoryID, &r.Action,
+		&r.Similarity, &r.OldSummary, &r.NewSummary, &r.Model, &r.CreatedAt)
+	return r, err
+}
+
+// FetchLatestVersion 获取记忆的最新历史版本
+func (s *Store) FetchLatestVersion(ctx context.Context, memoryID string) (MemoryVersionInsert, error) {
+	query := `
+SELECT memory_id, project_id, content_type, content, COALESCE(content_hash, ''), ts,
+       COALESCE(summary, ''), COALESCE(tags, '[]'::jsonb), COALESCE(axes, '{}'::jsonb),
+       COALESCE(index_path, '[]'::jsonb), COALESCE(chunk_count, 1), avg_embedding,
+       created_at, replaced_at
+FROM memory_versions
+WHERE memory_id = $1
+ORDER BY replaced_at DESC
+LIMIT 1`
+
+	var v MemoryVersionInsert
+	var tagsJSON, axesJSON, indexPathJSON []byte
+	var avgEmbedding pgvector.Vector
+	err := s.pool.QueryRow(ctx, query, memoryID).Scan(
+		&v.MemoryID, &v.ProjectID, &v.ContentType, &v.Content, &v.ContentHash, &v.Ts,
+		&v.Summary, &tagsJSON, &axesJSON, &indexPathJSON, &v.ChunkCount, &avgEmbedding,
+		&v.CreatedAt, &v.ReplacedAt,
+	)
+	if err != nil {
+		return v, err
+	}
+	v.Tags = decodeTags(tagsJSON)
+	v.Axes = decodeAxes(axesJSON)
+	v.IndexPath = decodeIndexPath(indexPathJSON)
+	v.AvgEmbedding = avgEmbedding.Slice()
+	return v, nil
+}
+
+// RestoreMemoryFromVersion 从历史版本恢复记忆
+func (s *Store) RestoreMemoryFromVersion(ctx context.Context, version MemoryVersionInsert) error {
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+
+	// 先把当前版本保存到 memory_versions
+	_, err = tx.Exec(ctx, `
+INSERT INTO memory_versions (memory_id, project_id, content_type, content, content_hash, ts, summary, tags, axes, index_path, chunk_count, avg_embedding, created_at, replaced_at)
+SELECT id, project_id, content_type, content, content_hash, ts, summary, tags, axes, index_path, chunk_count, avg_embedding, created_at, NOW()
+FROM memories WHERE id = $1`, version.MemoryID)
+	if err != nil {
+		return fmt.Errorf("保存当前版本失败: %w", err)
+	}
+
+	// 更新 memories 表
+	tagsJSON, _ := json.Marshal(version.Tags)
+	axesJSON, _ := json.Marshal(version.Axes)
+	indexPathJSON, _ := json.Marshal(version.IndexPath)
+
+	_, err = tx.Exec(ctx, `
+UPDATE memories SET
+  content_type = $2, content = $3, content_hash = $4, ts = $5,
+  summary = $6, tags = $7, axes = $8, index_path = $9,
+  chunk_count = $10, avg_embedding = $11, created_at = $12
+WHERE id = $1`,
+		version.MemoryID, version.ContentType, version.Content, version.ContentHash, version.Ts,
+		version.Summary, tagsJSON, axesJSON, indexPathJSON,
+		version.ChunkCount, pgvector.NewVector(version.AvgEmbedding), version.CreatedAt)
+	if err != nil {
+		return fmt.Errorf("恢复记忆失败: %w", err)
+	}
+
+	// 删除用于恢复的那个历史版本记录（避免重复）
+	_, err = tx.Exec(ctx, `
+DELETE FROM memory_versions
+WHERE memory_id = $1 AND replaced_at = $2`, version.MemoryID, version.ReplacedAt)
+	if err != nil {
+		return fmt.Errorf("清理历史版本失败: %w", err)
+	}
+
+	return tx.Commit(ctx)
 }

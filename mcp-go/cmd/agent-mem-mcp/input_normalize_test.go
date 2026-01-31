@@ -65,6 +65,12 @@ func TestNormalizeSearchInputDefaults(t *testing.T) {
 	if normalized.Limit != defaultSearchLimit {
 		t.Fatalf("limit 默认值错误: %d", normalized.Limit)
 	}
+	if normalized.Profile != "deep" {
+		t.Fatalf("profile 默认值错误: %s", normalized.Profile)
+	}
+	if normalized.Mode != "compact" {
+		t.Fatalf("mode 默认值错误: %s", normalized.Mode)
+	}
 }
 
 func TestResolveProjectIdentityFromPath(t *testing.T) {
@@ -77,5 +83,32 @@ func TestResolveProjectIdentityFromPath(t *testing.T) {
 	}
 	if name != "agent-mem" {
 		t.Fatalf("project_name 解析错误: %s", name)
+	}
+}
+
+func TestNormalizeIndexInputIndexPath(t *testing.T) {
+	settings := defaultSettings()
+	input := IndexInput{
+		OwnerID:   "personal",
+		Limit:     10,
+		IndexPath: []string{" Root ", "Sub"},
+	}
+	normalized, err := normalizeIndexInput(input, settings)
+	if err != nil {
+		t.Fatalf("归一化失败: %v", err)
+	}
+	if len(normalized.IndexPath) != 2 || normalized.IndexPath[0] != "root" || normalized.IndexPath[1] != "sub" {
+		t.Fatalf("index_path 归一化失败: %+v", normalized.IndexPath)
+	}
+}
+
+func TestValidateIndexInputPathTreeLimits(t *testing.T) {
+	input := IndexInput{OwnerID: "personal", Limit: 10, PathTreeDepth: maxIndexPathDepth + 1}
+	if err := validateIndexInput(input); err == nil {
+		t.Fatalf("期望 path_tree_depth 过大时报错")
+	}
+	input = IndexInput{OwnerID: "personal", Limit: 10, PathTreeWidth: 101}
+	if err := validateIndexInput(input); err == nil {
+		t.Fatalf("期望 path_tree_width 过大时报错")
 	}
 }
